@@ -22,6 +22,8 @@ let paid = {};
 let monthlyRecords = {};
 let historyImported = false;
 let historyImportVersion = 0;
+let dueNotices = {};
+let dueNoticeTimer;
 let localDatabase=null;
 let shownMonth = new Date(); shownMonth = new Date(shownMonth.getFullYear(), shownMonth.getMonth(), 1);
 let activeFilter = 'all';
@@ -31,7 +33,7 @@ const $ = id => document.getElementById(id);
 const currency = value => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(value);
 function readLegacyState(){try{const read=key=>{const value=localStorage.getItem(key);return value?JSON.parse(value):null};return{bills:read(LEGACY_STORAGE_KEYS[0]),paid:read(LEGACY_STORAGE_KEYS[1]),monthlyRecords:read(LEGACY_STORAGE_KEYS[2]),historyImported:read(LEGACY_STORAGE_KEYS[3]),historyImportVersion:read(LEGACY_STORAGE_KEYS[4])}}catch(error){console.warn('Could not read existing browser data for migration.',error);return null}}
 function clearLegacyState(){try{for(const key of LEGACY_STORAGE_KEYS)localStorage.removeItem(key)}catch(error){console.warn('Could not clear migrated browser data.',error)}}
-function writeDatabase(){if(!localDatabase)return Promise.reject(new Error('Local database is unavailable'));return new Promise((resolve,reject)=>{const transaction=localDatabase.transaction('appState','readwrite');transaction.objectStore('appState').put({bills,paid,monthlyRecords,historyImported,historyImportVersion,updatedAt:new Date().toISOString()},'current');transaction.oncomplete=resolve;transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error||new Error('Database write aborted'))})}
+function writeDatabase(){if(!localDatabase)return Promise.reject(new Error('Local database is unavailable'));return new Promise((resolve,reject)=>{const transaction=localDatabase.transaction('appState','readwrite');transaction.objectStore('appState').put({bills,paid,monthlyRecords,historyImported,historyImportVersion,dueNotices,updatedAt:new Date().toISOString()},'current');transaction.oncomplete=resolve;transaction.onerror=()=>reject(transaction.error);transaction.onabort=()=>reject(transaction.error||new Error('Database write aborted'))})}
 function save(){if(localDatabase)writeDatabase().catch(error=>console.warn('Could not save to the local database.',error))}
 function openLocalDatabase(){return new Promise((resolve,reject)=>{const request=indexedDB.open('BillwiseLocalData',1);request.onupgradeneeded=()=>{if(!request.result.objectStoreNames.contains('appState'))request.result.createObjectStore('appState')};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error)})}
 function readDatabaseState(){return new Promise((resolve,reject)=>{const transaction=localDatabase.transaction('appState','readonly');const request=transaction.objectStore('appState').get('current');request.onsuccess=()=>resolve(request.result||null);request.onerror=()=>reject(request.error)})}
@@ -62,6 +64,7 @@ async function initializeLocalDatabase(){
         monthlyRecords=savedState.monthlyRecords||monthlyRecords;
         historyImported=Boolean(savedState.historyImported||historyImported);
         historyImportVersion=Number(savedState.historyImportVersion||historyImportVersion);
+        dueNotices=savedState.dueNotices||{};
       }
       clearLegacyState();
     }else throw new Error('IndexedDB is not supported');
@@ -92,7 +95,6 @@ async function initializeLocalDatabase(){
   }else if(!historyImported){
     save();
   }else{
-    try{
     save();
   }
   render();
@@ -104,6 +106,8 @@ async function initializeLocalDatabase(){
     if(futureDueDatesUpdated)updates.push('future Citi and Renters due dates updated');
     showToast(updates.join('; ')||'Bill history imported: May 2017–December 2026');
   }
+  checkDueNotices();
+  scheduleDueNoticeCheck();
 }
 function monthKey(date=shownMonth){return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}`}
 function dueDateValue(month,record){if(record.dueOn&&/^\d{4}-\d{2}-\d{2}$/.test(record.dueOn))return record.dueOn;const period=month.split('-').map(Number);let day=record.dueDay;let year=period[0],monthNumber=period[1];const label=String(record.dueLabel||'').match(/^(\d{1,2})-([A-Za-z]{3})$/);if(label){day=Number(label[1]);const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];const labelMonth=months.indexOf(label[2][0].toUpperCase()+label[2].slice(1,3));if(labelMonth>=0){monthNumber=labelMonth+1;if(monthNumber-period[1]>6)year--;else if(period[1]-monthNumber>6)year++}}if(!day||day<1||monthNumber<1)return null;const lastDay=new Date(year,monthNumber,0).getDate();day=Math.min(day,lastDay);return `${year}-${String(monthNumber).padStart(2,'0')}-${String(day).padStart(2,'0')}`}
@@ -185,9 +189,11 @@ function setFutureDueDateDefaults(){
   if(carPayment)carPayment.dueDay=1;
   if(recology){recology.dueDay=25;recology.intervalMonths=3;recology.nextDueMonth='2026-12'}
 }
-function monthBills(){if(Object.prototype.hasOwnProperty.call(monthlyRecords,monthKey()))return monthlyRecords[monthKey()].map(record=>({...bills.find(bill=>bill.id===record.id),...record,historicalRecord:true}));return bills.filter(bill=>occursInMonth(bill,monthKey())).map(bill=>({...bill,historicalRecord:false}))}
+function monthBillsFor(month){if(Object.prototype.hasOwnProperty.call(monthlyRecords,month))return monthlyRecords[month].map(record=>({...bills.find(bill=>bill.id===record.id),...record,historicalRecord:true}));return bills.filter(bill=>occursInMonth(bill,month)).map(bill=>({...bill,historicalRecord:false}))}
+function monthBills(){return monthBillsFor(monthKey())}
 function occursInMonth(bill,month){if(!bill.intervalMonths||!bill.nextDueMonth)return true;const [year,monthNumber]=month.split('-').map(Number);const [anchorYear,anchorMonth]=bill.nextDueMonth.split('-').map(Number);const offset=(year-anchorYear)*12+(monthNumber-anchorMonth);return offset>=0&&offset%bill.intervalMonths===0}
-function isPaid(bill){const monthPaid=paid[monthKey()]||{};if(Object.prototype.hasOwnProperty.call(monthPaid,bill.id)){const value=monthPaid[bill.id];return typeof value==='object'&&value!==null&&Object.prototype.hasOwnProperty.call(value,'paid')?Boolean(value.paid):Boolean(value)}return Boolean(bill.sourcePaid)}
+function isPaidForMonth(bill,month){const monthPaid=paid[month]||{};if(Object.prototype.hasOwnProperty.call(monthPaid,bill.id)){const value=monthPaid[bill.id];return typeof value==='object'&&value!==null&&Object.prototype.hasOwnProperty.call(value,'paid')?Boolean(value.paid):Boolean(value)}return Boolean(bill.sourcePaid)}
+function isPaid(bill){return isPaidForMonth(bill,monthKey())}
 function amountFor(bill){if(bill.historicalRecord&&Object.prototype.hasOwnProperty.call(bill,'amount'))return bill.amount;const monthly=bill.monthlyAmounts||{};return Object.prototype.hasOwnProperty.call(monthly,monthKey())?monthly[monthKey()]:bill.amount}
 function paidOnFor(bill){const stored=paid[monthKey()]?.[bill.id];if(stored!==undefined){if(typeof stored==='object'&&stored!==null)return stored.paidOn||'';if(typeof stored==='string')return stored}return bill.paidOn||bill.paidOnRaw||''}
 function formatPaidOn(value){if(!value)return '—';if(!/^\d{4}-\d{2}-\d{2}$/.test(value))return value;const [year,month,day]=value.split('-').map(Number);return `${day}-${new Intl.DateTimeFormat('en-US',{month:'short'}).format(new Date(year,month-1,day))}`}
@@ -219,7 +225,31 @@ function dueDate(b){const lastDay=new Date(shownMonth.getFullYear(),shownMonth.g
 function calendarCells(visible){const firstDay=new Date(shownMonth.getFullYear(),shownMonth.getMonth(),1).getDay();const daysInMonth=new Date(shownMonth.getFullYear(),shownMonth.getMonth()+1,0).getDate();const today=new Date();const isCurrent=monthKey()===monthKey(new Date(today.getFullYear(),today.getMonth(),1));const cells=[];for(let i=0;i<firstDay;i++)cells.push('<div class="calendar-day outside" role="gridcell" aria-hidden="true"></div>');for(let day=1;day<=daysInMonth;day++){const dayBills=visible.filter(b=>b.dueDay&&dueDate(b).getDate()===day);const isToday=isCurrent&&today.getDate()===day;const todayClass=isToday?' today':'';const chips=dayBills.map(b=>`<button class="calendar-bill ${isPaid(b)?'settled':''}" data-action="toggle" data-id="${b.id}" title="${escapeHTML(b.name)} · ${formatAmount(amountFor(b))} · ${isPaid(b)?'Paid':'To pay'}"><span>${escapeHTML(b.name)}</span><strong>${formatAmount(amountFor(b))}</strong></button>`).join('');cells.push(`<div class="calendar-day${todayClass}" role="gridcell"${isToday?' aria-label="Today"':''}><div class="calendar-day-heading"><span class="calendar-date">${day}</span>${isToday?'<span class="current-day-label">Today</span>':''}</div>${chips}</div>`)}const remainder=(7-(cells.length%7))%7;for(let i=0;i<remainder;i++)cells.push('<div class="calendar-day outside" role="gridcell" aria-hidden="true"></div>');return cells.join('')}
 function billRow(b){const [bg,fg,icon]=colors[b.category]||colors.Other;const done=isPaid(b);const due=b.dueDay?dueDate(b):null;const now=new Date();const delta=due?Math.ceil((new Date(due.getFullYear(),due.getMonth(),due.getDate())-new Date(now.getFullYear(),now.getMonth(),now.getDate()))/86400000):null;const dueText=b.dueLabel||(due?`${due.getDate()}-${new Intl.DateTimeFormat('en-US',{month:'short'}).format(due)}`:'—');let dueClass='';if(due&&monthKey()===monthKey(new Date(now.getFullYear(),now.getMonth(),1))){if(delta<0&&!done)dueClass='late';else if(delta<=1&&!done)dueClass='urgent'}const sourceTitle=b.sourceStatus?` title="Source status: ${escapeHTML(b.sourceStatus)}"`:'';const paidDateTitle=b.paidDateGenerated?' title="Filled using the due date"':'';return `<article class="bill-row"><div class="bill-name-cell"><span class="bill-symbol" style="background:${bg};color:${fg}">${icon}</span><div><strong>${escapeHTML(b.name)}</strong><small>${escapeHTML(b.note||b.category)}</small></div></div><span class="bill-due ${dueClass}">${escapeHTML(dueText)}</span><span class="paid-date"${paidDateTitle}>${formatPaidOn(paidOnFor(b))}</span><span class="bill-amount">${formatAmount(amountFor(b))}</span><button class="status-btn ${done?'is-paid':''}" data-action="toggle" data-id="${b.id}"${sourceTitle}>${done?'✓ Paid':'Mark paid'}</button><button class="row-menu" data-action="edit" data-id="${b.id}" aria-label="Edit ${escapeHTML(b.name)}">✎</button></article>`}
 function escapeHTML(value){return String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}
-function showToast(message){const toast=$('toast');toast.textContent=message;toast.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.classList.remove('show'),2200)}
+function showToast(message){const toast=$('toast');toast.textContent=message;toast.classList.remove('due-notice');toast.setAttribute('role','status');toast.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.classList.remove('show'),2200)}
+function showDueNotice(message){const toast=$('toast');toast.textContent=message;toast.setAttribute('role','alert');toast.classList.add('show','due-notice');clearTimeout(toastTimer);toastTimer=setTimeout(()=>{toast.classList.remove('show','due-notice');toast.setAttribute('role','status')},8000)}
+function checkDueNotices(){
+  if(!localDatabase)return;
+  const now=new Date();
+  const todayKey=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+  const currentMonth=monthKey(new Date(now.getFullYear(),now.getMonth(),1));
+  const dueToday=monthBillsFor(currentMonth).filter(bill=>dueDateValue(currentMonth,bill)===todayKey&&!isPaidForMonth(bill,currentMonth));
+  const unseen=dueToday.filter(bill=>!dueNotices[`${todayKey}:${bill.id}`]);
+  if(!unseen.length)return;
+  unseen.forEach(bill=>{dueNotices[`${todayKey}:${bill.id}`]=true});
+  save();
+  const names=unseen.map(bill=>bill.name);
+  const summary=names.length<=3?names.join(', '):`${names.slice(0,3).join(', ')} and ${names.length-3} more`;
+  window.billwiseNotifications?.notifyDueBills({names});
+  showDueNotice(`${names.length} ${names.length===1?'bill is':'bills are'} due today: ${summary}`);
+}
+function scheduleDueNoticeCheck(){
+  clearTimeout(dueNoticeTimer);
+  const now=new Date();
+  const nextCheck=new Date(now.getFullYear(),now.getMonth(),now.getDate()+1,0,0,1);
+  dueNoticeTimer=setTimeout(()=>{checkDueNotices();scheduleDueNoticeCheck()},nextCheck.getTime()-now.getTime());
+}
+window.addEventListener('focus',checkDueNotices);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkDueNotices()});
 function openDialog(bill){const form=$('bill-form');form.reset();$('dialog-title').textContent=bill?'Edit bill':'Add a bill';$('save-bill').innerHTML=bill?'Save changes <span>→</span>':'Save bill <span>→</span>';form.dataset.editId=bill?.id||'';$('delete-bill').classList.toggle('hidden',!bill);if(bill){$('bill-name').value=bill.name;$('bill-amount').value=amountFor(bill)??'';$('bill-due').value=bill.dueDay??'';$('bill-category').value=bill.category;$('bill-note').value=bill.note||''}$('bill-dialog').showModal();setTimeout(()=>$('bill-name').focus(),50)}
 for(let day=0;day<=31;day++)$('bill-due').insertAdjacentHTML('beforeend',day===0?'<option value="">No due date</option>':`<option value="${day}">${day}${day===1?'st':day===2?'nd':day===3?'rd':'th'} of the month</option>`);
 $('add-bill-btn').addEventListener('click',()=>openDialog());$('empty-add').addEventListener('click',()=>openDialog());$('close-dialog').addEventListener('click',()=>$('bill-dialog').close());$('cancel-dialog').addEventListener('click',()=>$('bill-dialog').close());
