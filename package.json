@@ -19,7 +19,10 @@
     "files": [
       "index.html",
       "app.js",
+<<<<<<< HEAD
       "bill-history.js",
+=======
+>>>>>>> 8c8ea17 (Initial commit without personal data or build artifacts)
       "styles.css",
       "electron/**/*",
       "package.json"
