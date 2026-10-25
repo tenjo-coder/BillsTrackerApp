@@ -1,0 +1,14 @@
+# Local bill history contains private financial records
+bill-history.js
+
+# Build artifacts and installers
+/dist/
+
+# Local databases and backups
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
